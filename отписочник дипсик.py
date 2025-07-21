@@ -176,7 +176,6 @@ async def start(update: Update, context: CallbackContext):
         reply_markup=kb,
         parse_mode='HTML'
     )
-    return ConversationHandler.END
 
 # Обработка кнопок стартового меню
 async def handle_buttons(update: Update, context: CallbackContext):
@@ -384,45 +383,50 @@ async def cancel(update: Update, context: CallbackContext):
     return ConversationHandler.END
 
 # Основная функция
-async def main():
-    # Инициализация БД
-    await init_db()
+def main():
+    # Создание нового event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
-    # Создание приложения
-    application = Application.builder().token(TOKEN).build()
-    
-    # Обработчики
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(handle_buttons, pattern='^(start_form|contact_admin|about_service)$')
-        ],
-        states={
-            FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_fio)],
-            SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_source)],
-            BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_bank)],
-            CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_card)],
-            EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_email)],
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_phone)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-        per_message=False,
-        per_user=True,
-        per_chat=True
-    )
-    
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(handle_payment_button, pattern='^pay_(rub|stars):'))
-    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-    application.add_handler(PreCheckoutQueryHandler(pre_checkout))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))
-    
-    # Запуск бота
-    logger.info("Бот для отписки запущен")
-    await application.run_polling()
-
-if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        # Инициализация БД
+        loop.run_until_complete(init_db())
+        
+        # Создание приложения
+        application = Application.builder().token(TOKEN).build()
+        
+        # Обработчики
+        conv_handler = ConversationHandler(
+            entry_points=[
+                CommandHandler('start', start),
+                CallbackQueryHandler(handle_buttons, pattern='^(start_form|contact_admin|about_service)$')
+            ],
+            states={
+                FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_fio)],
+                SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_source)],
+                BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_bank)],
+                CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_card)],
+                EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_email)],
+                PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_phone)],
+            },
+            fallbacks=[CommandHandler('cancel', cancel)],
+            per_user=True,
+            per_chat=True
+        )
+        
+        application.add_handler(conv_handler)
+        application.add_handler(CallbackQueryHandler(handle_payment_button, pattern='^pay_(rub|stars):'))
+        application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+        application.add_handler(PreCheckoutQueryHandler(pre_checkout))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))
+        
+        # Запуск бота
+        logger.info("Бот для отписки запущен")
+        application.run_polling()
     except Exception as e:
         logger.critical(f"Критическая ошибка: {e}")
+    finally:
+        loop.close()
+
+if __name__ == "__main__":
+    main()

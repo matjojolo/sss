@@ -209,6 +209,23 @@ async def process_phone(update: Update, context: CallbackContext):
     context.user_data.clear()
     return ConversationHandler.END
 
+async def handle_free_text(update: Update, context: CallbackContext):
+    user_message = update.message.text
+    user_id = update.message.from_user.id
+    
+    if context.user_data.get('contact_admin'):
+        await context.bot.send_message(GROUP_ID, f"✉️ Сообщение от пользователя {user_id}:\n{user_message}")
+        await update.message.reply_text("✅ Ваше сообщение отправлено администратору.")
+        context.user_data['contact_admin'] = False
+        return
+    
+    try:
+        response = await ask_deepseek(user_message)
+        await update.message.reply_text(response)
+    except Exception as e:
+        logger.error(f"Ошибка обработки вопроса: {e}")
+        await update.message.reply_text("⚠️ Произошла ошибка при обработке вашего вопроса. Попробуйте позже.")
+
 async def handle_payment_button(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()

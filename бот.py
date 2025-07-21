@@ -1,33 +1,45 @@
 import os
-if os.path.exists("userdata.db"):
-    os.remove("userdata.db")
-
+import re
 import asyncio
 import logging
 import aiosqlite
-import re
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup,
-    InlineKeyboardButton, LabeledPrice, PreCheckoutQuery
+    InlineKeyboardButton, LabeledPrice, PreCheckoutQuery, ContentType
 )
 from aiogram.filters import CommandStart
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
+# Telegram bot token
 API_TOKEN = '7514289103:AAEPjVet23FqF7VGsqKEE6rVw-H348w-_XQ'
-API_STARS_PROVIDER_TOKEN = 'YOUR_STARS_PROVIDER_TOKEN_HERE'
+# Для оплаты звёздами переиспользуем тот же токен
+API_STARS_PROVIDER_TOKEN = '7514289103:AAEPjVet23FqF7VGsqKEE6rVw-H348w-_XQ'
+
+# ID группы для уведомлений
 GROUP_ID = -1002579257687
 
-# Фиксированная стоимость услуг в рублях и звёздах
+# Путь к базе и цены
+DB_PATH = 'userdata.db'
 PRICE_RUB = 399
 PRICE_STARS = 200
 
+# Флаг проверки платежей через DeepSik
+USE_DEEPSEEK = True
+if USE_DEEPSEEK:
+    import deepsik
+    deepsik_client = deepsik.Client(api_key='YOUR_DEEPSEEK_API_KEY')
+else:
+    deepsik_client = None
+
+# Инициализация бота и диспетчера
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+# FSM состояния
 class Form(StatesGroup):
     fio = State()
     source = State()
@@ -36,166 +48,166 @@ class Form(StatesGroup):
     email = State()
     phone = State()
 
+# Паттерны валидации
+FIO_PATTERN = re.compile(r'^[А-ЯЁ][а-яё]+\s[А-ЯЁ][а-яё]+\s[А-ЯЁ][а-яё]+$')
+CARD_PATTERN = re.compile(r'^\d{6}\*\d{4}$')
+EMAIL_PATTERN = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+PHONE_PATTERN = re.compile(r'^\+?\d{10,15}$')
 
-def is_valid_fio(text: str) -> bool:
-    parts = text.strip().split()
-    if len(parts) != 3:
-        return False
-    pattern = r'^[А-ЯЁ][а-яё]+'
-    return all(re.match(pattern, part) for part in parts)
+# Функции работы с БД
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER,
+                fio TEXT, source TEXT, bank TEXT, card TEXT, email TEXT, phone TEXT
+            )''')
+        await db.commit()
 
+async def save_data(user_id, data):
+    await init_db()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            'INSERT INTO users (telegram_id, fio, source, bank, card, email, phone) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (user_id, data['fio'], data['source'], data['bank'], data['card'], data['email'], data['phone'])
+        )
+        await db.commit()
+
+# Команда /start с кнопками
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    text = (
-        "👋 <b>Здравствуйте!</b>\n"
-        "Вы обратились в <i>«Отписка Бот»</i> — помощника в вопросах списаний.\n\n"
-        "🔍 Мы помогаем:\n"
-        "— выяснить источники списаний\n"
-        "— отправить анкету на отмену услуг\n\n"
-        "📋 Нажмите «Продолжить», чтобы начать"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Продолжить", callback_data="agree")],
-        [InlineKeyboardButton(text="📨 Связаться с админом", callback_data="contact_admin")]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton('✅ Продолжить', callback_data='start_form')],
+        [InlineKeyboardButton('📨 Связаться с админом', callback_data='contact_admin')]
     ])
-    await message.answer(text, reply_markup=kb)
+    await message.answer(
+        '👋 <b>Здравствуйте!</b>\n'
+        'Вы обратились в <i>Отписка Бот</i>.',
+        reply_markup=kb
+    )
 
-@dp.callback_query(F.data == "agree")
-async def agree_callback(callback: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data=='start_form')
+async def start_form(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
     await state.set_state(Form.fio)
-    await callback.message.answer("👤 Введите своё <b>ФИО</b>:")
-    await callback.answer()
+    await cb.message.edit_text('👤 Введите ФИО (Три слова, первая буква заглавная):')
+    await cb.answer()
 
-@dp.callback_query(F.data == "contact_admin")
-async def contact_admin(callback: CallbackQuery):
-    await callback.message.answer("📨 Напишите ваше сообщение, и мы ответим вам.")
-    await callback.answer()
+@dp.callback_query(F.data=='contact_admin')
+async def contact_admin(cb: CallbackQuery):
+    await cb.message.edit_text('📨 Напишите ваше сообщение для админа:')
+    await cb.answer()
 
+# Обработчики формы с валидацией
 @dp.message(Form.fio)
-async def process_fio(message: Message, state: FSMContext):
-    if not is_valid_fio(message.text):
-        await message.answer("❗ Пожалуйста, введите корректное ФИО, например: <b>Иванов Петр Сергеевич</b>")
-        return
-    await state.update_data(fio=message.text)
+async def process_fio(msg: Message, state: FSMContext):
+    if not FIO_PATTERN.match(msg.text):
+        return await msg.answer('❗ Неверный формат ФИО. Например: Иванов Петр Сергеевич')
+    await state.update_data(fio=msg.text)
     await state.set_state(Form.source)
-    await message.answer("📃 Укажите, откуда идёт списание (сайт/сервис):")
+    await msg.answer('📃 Укажите источник списания (сайт или сервис):')
 
 @dp.message(Form.source)
-async def process_source(message: Message, state: FSMContext):
-    await state.update_data(source=message.text)
+async def process_source(msg: Message, state: FSMContext):
+    if len(msg.text) < 3:
+        return await msg.answer('❗ Опишите источник минимум 3 символами')
+    await state.update_data(source=msg.text)
     await state.set_state(Form.bank)
-    await message.answer("🏦 Введите название банка, с которого происходят списания:")
+    await msg.answer('🏦 Введите название банка:')
 
 @dp.message(Form.bank)
-async def process_bank(message: Message, state: FSMContext):
-    await state.update_data(bank=message.text)
+async def process_bank(msg: Message, state: FSMContext):
+    if not re.match(r'^[\w\s]{3,}$', msg.text):
+        return await msg.answer('❗ Неверное название банка')
+    await state.update_data(bank=msg.text)
     await state.set_state(Form.card)
-    await message.answer("💳 Введите 6 первых и 4 последних цифры карты (123456*7890):")
+    await msg.answer('💳 Введите карту (123456*7890):')
 
 @dp.message(Form.card)
-async def process_card(message: Message, state: FSMContext):
-    await state.update_data(card=message.text)
+async def process_card(msg: Message, state: FSMContext):
+    if not CARD_PATTERN.match(msg.text):
+        return await msg.answer('❗ Формат карты: 6 цифр, звёздочка, 4 цифры')
+    await state.update_data(card=msg.text)
     await state.set_state(Form.email)
-    await message.answer("📧 Введите ваш email:")
+    await msg.answer('📧 Введите email:')
 
 @dp.message(Form.email)
-async def process_email(message: Message, state: FSMContext):
-    await state.update_data(email=message.text)
+async def process_email(msg: Message, state: FSMContext):
+    if not EMAIL_PATTERN.match(msg.text):
+        return await msg.answer('❗ Некорректный email. Пример: user@example.com')
+    await state.update_data(email=msg.text)
     await state.set_state(Form.phone)
-    await message.answer("📱 Введите ваш номер телефона:")
+    await msg.answer('📱 Введите телефон (10–15 цифр, можно с +):')
 
 @dp.message(Form.phone)
-async def process_phone(message: Message, state: FSMContext):
-    await state.update_data(phone=message.text)
+async def process_phone(msg: Message, state: FSMContext):
+    if not PHONE_PATTERN.match(msg.text):
+        return await msg.answer('❗ Некорректный телефон. Только цифры, 10–15 символов')
     data = await state.get_data()
-
-    await recreate_db_if_needed()
-    await save_to_db(message.from_user.id, data)
-
+    await state.clear()
+    await save_data(msg.from_user.id, data)
+    # Отправляем админам
     text = (
-        f"<b>Новая анкета:</b>\n"
+        f"<b>Новая заявка:</b>\n"
         f"👤 ФИО: {data['fio']}\n"
-        f"📄 Источник списания: {data['source']}\n"
+        f"📄 Источник: {data['source']}\n"
         f"🏦 Банк: {data['bank']}\n"
         f"💳 Карта: {data['card']}\n"
         f"📧 Email: {data['email']}\n"
         f"📱 Телефон: {data['phone']}"
     )
     await bot.send_message(GROUP_ID, text)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💳 Оплатить {PRICE_RUB}₽", url="https://www.tinkoff.ru")],
-        [InlineKeyboardButton(text=f"⭐ Оплатить {PRICE_STARS} звёзд", callback_data=f"pay_stars:{PRICE_STARS}")]
+    # Опции оплаты
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"💳 Оплатить {PRICE_RUB}₽", url="https://www.tinkoff.ru")],
+        [InlineKeyboardButton(f"⭐ Оплатить {PRICE_STARS}⭐", callback_data=f"pay_stars:{PRICE_STARS}")]
     ])
-    await message.answer(
-        f"💰 Для завершения процедуры оплатите {PRICE_RUB}₽ или {PRICE_STARS} звёзд:",
-        reply_markup=kb
-    )
-    await message.answer("✅ Ваша заявка принята. Ожидайте ответ в течение 48 часов.")
-    await state.clear()
+    await msg.answer('💰 Оплатите для завершения:', reply_markup=kb)
 
-@dp.callback_query(F.data.startswith("pay_stars:"))
-async def pay_stars_callback(callback: CallbackQuery):
-    _, amount = callback.data.split(":")
-    stars = int(amount)
-    prices = [LabeledPrice(label="Отписка Бот", amount=stars)]
+# Обработчики оплаты
+@dp.callback_query(F.data.startswith('pay_stars:'))
+async def pay_stars_cb(cb: CallbackQuery):
+    _, amt = cb.data.split(':')
+    prices = [LabeledPrice(label="Отписка Бот", amount=int(amt))]
     await bot.send_invoice(
-        chat_id=callback.from_user.id,
+        chat_id=cb.from_user.id,
         title="Оплата звёздами",
-        description="Оплата услуг по отмене подписок",
-        payload="payment_stars",
+        description="Оплата услуг по отмене списаний",
+        payload="stars",
         provider_token=API_STARS_PROVIDER_TOKEN,
         currency="STAR",
         prices=prices
     )
-    await callback.answer()
+    await cb.answer()
 
-@dp.pre_checkout_query(lambda query: True)
-async def process_pre_checkout(query: PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(pre_checkout_query_id=query.id, ok=True)
+@dp.pre_checkout_query(lambda q: True)
+async def pre_checkout(q: PreCheckoutQuery):
+    # Проверка платежа через DeepSik (если включено)
+    if USE_DEEPSEEK and deepsik_client:
+        user_id = q.from_user.id
+        amount = q.total_amount
+        payload = getattr(q, 'invoice_payload', None)
+        try:
+            result = deepsik_client.verify_payment(user_id=user_id, amount=amount, payload=payload)
+        except Exception:
+            await bot.answer_pre_checkout_query(q.id, ok=False, error_message="Ошибка проверки платежа.")
+            return
+        if not getattr(result, 'valid', False):
+            await bot.answer_pre_checkout_query(q.id, ok=False, error_message="Платеж не прошёл проверку.")
+            await bot.send_message(GROUP_ID, f"⚠️ Платёж пользователя {user_id} не прошёл проверку DeepSik.")
+            return
+    await bot.answer_pre_checkout_query(q.id, ok=True)
 
-@dp.message(F.content_type == types.ContentType.SUCCESSFUL_PAYMENT)
-async def successful_payment(message: Message):
-    await message.answer("✅ Оплата прошла успешно! Ваша заявка будет обработана.")
-    # Здесь можно запустить логику автоматической обработки
+@dp.message(F.content_type == ContentType.SUCCESSFUL_PAYMENT)
+async def successful_pay(msg: Message):
+    await bot.send_message(GROUP_ID, f"✅ Оплата прошла: {msg.from_user.full_name} (ID {msg.from_user.id})")
+    await msg.answer("✅ Ваш платёж подтвержён.")
 
-async def recreate_db_if_needed():
-    async with aiosqlite.connect("userdata.db") as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER,
-                fio TEXT,
-                source TEXT,
-                bank TEXT,
-                card TEXT,
-                email TEXT,
-                phone TEXT
-            )
-        """
-        )
-        await db.commit()
-
-async def save_to_db(user_id, data):
-    async with aiosqlite.connect("userdata.db") as db:
-        await db.execute("""
-            INSERT INTO users (telegram_id, fio, source, bank, card, email, phone)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            user_id,
-            data['fio'],
-            data['source'],
-            data['bank'],
-            data['card'],
-            data['email'],
-            data['phone']
-        ))
-        await db.commit()
-
+# Запуск бота
 async def main():
     logging.basicConfig(level=logging.INFO)
     await dp.start_polling(bot)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
-    

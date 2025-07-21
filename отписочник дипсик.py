@@ -8,12 +8,13 @@ import requests
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    LabeledPrice
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    CallbackContext, CallbackQueryHandler, ConversationHandler,
-    ContextTypes, PreCheckoutQueryHandler
+    CallbackContext, CallbackQueryHandler, JobQueue,
+    ConversationHandler, ContextTypes, PreCheckoutQueryHandler
 )
 from dotenv import load_dotenv
 
@@ -21,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 API_STARS_PROVIDER_TOKEN = os.getenv("PAYMENT_TOKEN")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")  # API-ключ для DeepSeek
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
 # Проверка наличия обязательных ключей
 if not TOKEN or not API_STARS_PROVIDER_TOKEN or not DEEPSEEK_API_KEY:
@@ -30,13 +31,24 @@ if not TOKEN or not API_STARS_PROVIDER_TOKEN or not DEEPSEEK_API_KEY:
 # Настройка логирования
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-file_handler = RotatingFileHandler('unsub_bot.log', maxBytes=5*1024*1024, backupCount=3)
+
+# Логирование в файл с ротацией
+file_handler = RotatingFileHandler(
+    'unsub_bot.log', 
+    maxBytes=5*1024*1024,  # 5 MB
+    backupCount=3
+)
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
+
+# Логирование в консоль
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
+
+# Уменьшаем логирование сторонних библиотек
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Конфигурация
@@ -60,18 +72,30 @@ async def init_db():
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER,
+                telegram_id INTEGER UNIQUE,
                 fio TEXT, source TEXT, bank TEXT, card TEXT, email TEXT, phone TEXT,
-                payment_status TEXT DEFAULT 'pending'
+                payment_status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                message_text TEXT,
+                is_admin BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(telegram_id)
             )''')
         await db.commit()
 
 async def save_data(user_id, data):
-    await init_db()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            '''INSERT INTO users (telegram_id, fio, source, bank, card, email, phone) VALUES (?, ?, ?, ?, ?, ?, ?)''',
-            (user_id, data['fio'], data['source'], data['bank'], data['card'], data['email'], data['phone'])
+            '''INSERT OR REPLACE INTO users 
+            (telegram_id, fio, source, bank, card, email, phone) 
+            VALUES (?, ?, ?, ?, ?, ?, ?)''',
+            (user_id, data['fio'], data['source'], data['bank'], 
+             data['card'], data['email'], data['phone'])
         )
         await db.commit()
 
@@ -83,204 +107,322 @@ async def update_payment_status(user_id, status):
         )
         await db.commit()
 
-# DeepSeek helper
-def ask_deepseek(prompt):
-    url = "https://api.deepseek.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-    system_prompt = (
-        "Ты — помощник бота для отмены подписок. Проверяй и корректируй ввод пользователя."
-    )
-    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]
-    data = {"model": "deepseek-chat", "messages": messages, "temperature": 0.7, "max_tokens": 500}
-    try:
-        resp = requests.post(url, headers=headers, json=data, timeout=20)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error(f"DeepSeek error: {e}")
-        return "Сервис недоступен, попробуйте позже."
+async def save_message(user_id, message_text, is_admin=False):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO messages (user_id, message_text, is_admin) VALUES (?, ?, ?)",
+            (user_id, message_text, is_admin)
+        )
+        await db.commit()
 
-# /start
+# Функция для общения с DeepSeek API
+async def ask_deepseek(prompt, context=None):
+    url = "https://api.deepseek.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    
+    system_prompt = """
+    Ты - помощник в боте для отмены подписок. Твоя задача:
+    1. Помогать пользователям правильно формулировать запросы для формы отписки
+    2. Отвечать на вопросы о процессе отписки
+    3. Объяснять, как работает сервис
+    4. Корректировать некорректные формулировки пользователя
+    
+    Важные правила:
+    - Если пользователь спрашивает о процессе отписки, дай краткий ответ
+    - Если пользователь ввел данные с ошибкой, вежливо попроси исправить
+    - Не отвечай на вопросы, не связанные с отпиской
+    - Сохраняй профессиональный и вежливый тон
+    - Отвечай кратко, 1-3 предложения
+    """
+    
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    if context:
+        messages.extend(context)
+    
+    messages.append({"role": "user", "content": prompt})
+
+    data = {
+        "model": "deepseek-chat",
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 500,
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=20)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+    except requests.exceptions.Timeout:
+        logger.warning("Тайм-аут при запросе к DeepSeek API")
+        return "Извините, сейчас не могу ответить. Пожалуйста, попробуйте позже."
+    except Exception as e:
+        logger.error(f"Ошибка DeepSeek API: {e}")
+        return "Произошла ошибка при обработке вашего запроса."
+
+# Команда /start с кнопками
 async def start(update: Update, context: CallbackContext):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton('✅ Продолжить', callback_data='start_form')],
-        [InlineKeyboardButton('📨 Связаться с админом', callback_data='contact_admin')]
+        [InlineKeyboardButton('📨 Связаться с админом', callback_data='contact_admin')],
+        [InlineKeyboardButton('ℹ️ О сервисе', callback_data='about_service')]
     ])
     await update.message.reply_text(
-        '👋 <b>Здравствуйте!</b>\nВы в Отписка Бот для отмены списаний.',
-        reply_markup=kb
+        '👋 <b>Здравствуйте!</b>\n'
+        'Вы обратились в <i>Отписка Бот</i> для отмены нежелательных списаний.',
+        reply_markup=kb,
+        parse_mode='HTML'
     )
     return ConversationHandler.END
 
-# Кнопки
+# Обработка кнопок стартового меню
 async def handle_buttons(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
+    
     if query.data == 'start_form':
         await query.message.edit_text('👤 Введите ФИО (Три слова, первая буква заглавная):')
         return FIO
-    if query.data == 'contact_admin':
-        await query.message.edit_text('📨 Напишите сообщение для админа:')
+    elif query.data == 'contact_admin':
+        await query.message.edit_text('📨 Напишите ваше сообщение для админа:')
         context.user_data['contact_admin'] = True
         return ConversationHandler.END
+    elif query.data == 'about_service':
+        await query.message.edit_text(
+            'ℹ️ <b>О сервисе:</b>\n\n'
+            'Мы помогаем отменить нежелательные подписки и списания с ваших карт.\n'
+            'Среднее время обработки заявки: 1-3 рабочих дня.\n'
+            'Стоимость услуги: 399 руб или 200 звезд.',
+            parse_mode='HTML'
+        )
+        return ConversationHandler.END
+    
     return ConversationHandler.END
 
-# Формы
+# Обработчики формы с валидацией и коррекцией через DeepSeek
 async def process_fio(update: Update, context: CallbackContext):
-    text = update.message.text
-    if not FIO_PATTERN.match(text):
-        corr = ask_deepseek(f"Проверь ФИО: '{text}'")
-        await update.message.reply_text(corr)
+    user_input = update.message.text
+    
+    if not FIO_PATTERN.match(user_input):
+        correction_prompt = f"Пользователь ввел ФИО: '{user_input}'. Это не соответствует формату 'Фамилия Имя Отчество'. Попроси исправить."
+        correction = await ask_deepseek(correction_prompt)
+        await update.message.reply_text(correction)
         return FIO
-    context.user_data['fio'] = text
-    await update.message.reply_text('📃 Укажите источник списания:')
+    
+    context.user_data['fio'] = user_input
+    await update.message.reply_text('📃 Укажите источник списания (сайт или сервис):')
     return SOURCE
 
 async def process_source(update: Update, context: CallbackContext):
-    text = update.message.text
-    if len(text) < 3:
-        corr = ask_deepseek(f"Проверь источник: '{text}'")
-        await update.message.reply_text(corr)
+    user_input = update.message.text
+    
+    if len(user_input) < 3:
+        correction_prompt = f"Пользователь описал источник списания: '{user_input}'. Это слишком коротко. Попроси дать более подробное описание."
+        correction = await ask_deepseek(correction_prompt)
+        await update.message.reply_text(correction)
         return SOURCE
-    context.user_data['source'] = text
+    
+    context.user_data['source'] = user_input
     await update.message.reply_text('🏦 Введите название банка:')
     return BANK
 
 async def process_bank(update: Update, context: CallbackContext):
-    text = update.message.text
-    if not re.match(r'^[\w\s]{3,}$', text):
-        corr = ask_deepseek(f"Проверь банк: '{text}'")
-        await update.message.reply_text(corr)
+    user_input = update.message.text
+    
+    if not re.match(r'^[\w\s]{3,}$', user_input):
+        correction_prompt = f"Пользователь ввел название банка: '{user_input}'. Это не похоже на реальное название банка. Попроси уточнить."
+        correction = await ask_deepseek(correction_prompt)
+        await update.message.reply_text(correction)
         return BANK
-    context.user_data['bank'] = text
-    await update.message.reply_text('💳 Введите карту (123456*7890):')
+    
+    context.user_data['bank'] = user_input
+    await update.message.reply_text('💳 Введите карту (формат: 123456*7890):')
     return CARD
 
 async def process_card(update: Update, context: CallbackContext):
-    text = update.message.text
-    if not CARD_PATTERN.match(text):
-        corr = ask_deepseek(f"Проверь карту: '{text}'")
-        await update.message.reply_text(corr)
+    user_input = update.message.text
+    
+    if not CARD_PATTERN.match(user_input):
+        correction_prompt = f"Пользователь ввел номер карты: '{user_input}'. Требуется формат '123456*7890'. Попроси исправить."
+        correction = await ask_deepseek(correction_prompt)
+        await update.message.reply_text(correction)
         return CARD
-    context.user_data['card'] = text
+    
+    context.user_data['card'] = user_input
     await update.message.reply_text('📧 Введите email:')
     return EMAIL
 
 async def process_email(update: Update, context: CallbackContext):
-    text = update.message.text
-    if not EMAIL_PATTERN.match(text):
-        corr = ask_deepseek(f"Проверь email: '{text}'")
-        await update.message.reply_text(corr)
+    user_input = update.message.text
+    
+    if not EMAIL_PATTERN.match(user_input):
+        correction_prompt = f"Пользователь ввел email: '{user_input}'. Это не похоже на валидный email. Попроси исправить."
+        correction = await ask_deepseek(correction_prompt)
+        await update.message.reply_text(correction)
         return EMAIL
-    context.user_data['email'] = text
-    await update.message.reply_text('📱 Введите телефон:')
+    
+    context.user_data['email'] = user_input
+    await update.message.reply_text('📱 Введите телефон (10-15 цифр, можно с +):')
     return PHONE
 
 async def process_phone(update: Update, context: CallbackContext):
-    text = update.message.text
-    if not PHONE_PATTERN.match(text):
-        corr = ask_deepseek(f"Проверь телефон: '{text}'")
-        await update.message.reply_text(corr)
+    user_input = update.message.text
+    
+    if not PHONE_PATTERN.match(user_input):
+        correction_prompt = f"Пользователь ввел телефон: '{user_input}'. Требуется формат из 10-15 цифр. Попроси исправить."
+        correction = await ask_deepseek(correction_prompt)
+        await update.message.reply_text(correction)
         return PHONE
-    context.user_data['phone'] = text
+    
+    context.user_data['phone'] = user_input
     user_id = update.message.from_user.id
+    
+    # Сохраняем данные
     await save_data(user_id, context.user_data)
-    info = (
-        f"<b>Новая заявка:</b>\n"
-        f"👤 {context.user_data['fio']}\n"
-        f"📄 {context.user_data['source']}\n"
-        f"🏦 {context.user_data['bank']}\n"
-        f"💳 {context.user_data['card']}\n"
-        f"📧 {context.user_data['email']}\n"
-        f"📱 {context.user_data['phone']}"
+    
+    # Отправляем уведомление в группу
+    text = (
+        f"<b>Новая заявка на отписку:</b>\n"
+        f"👤 ФИО: {context.user_data['fio']}\n"
+        f"📄 Источник: {context.user_data['source']}\n"
+        f"🏦 Банк: {context.user_data['bank']}\n"
+        f"💳 Карта: {context.user_data['card']}\n"
+        f"📧 Email: {context.user_data['email']}\n"
+        f"📱 Телефон: {context.user_data['phone']}"
     )
-    await context.bot.send_message(GROUP_ID, info)
+    await context.bot.send_message(GROUP_ID, text, parse_mode='HTML')
+    
+    # Опции оплаты
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"💳 Оплатить {PRICE_RUB}₽", callback_data=f"pay_rub:{PRICE_RUB}" )],
+        [InlineKeyboardButton(f"💳 Оплатить {PRICE_RUB}₽", callback_data=f"pay_rub:{PRICE_RUB}")],
         [InlineKeyboardButton(f"⭐ Оплатить {PRICE_STARS}⭐", callback_data=f"pay_stars:{PRICE_STARS}")]
     ])
-    await update.message.reply_text('💰 Оплатите услугу:', reply_markup=kb)
+    await update.message.reply_text('💰 Оплатите услугу для завершения:', reply_markup=kb)
+    
+    # Очищаем данные
+    context.user_data.clear()
     return ConversationHandler.END
 
+# Обработка свободных вопросов через DeepSeek
 async def handle_free_text(update: Update, context: CallbackContext):
+    user_message = update.message.text
+    user_id = update.message.from_user.id
+    
     if context.user_data.get('contact_admin'):
-        await context.bot.send_message(GROUP_ID, f"✉️ Сообщение от {update.effective_user.id}: {update.message.text}")
-        await update.message.reply_text("✅ Отправлено администратору.")
-        context.user_data.clear()
+        admin_text = f"✉️ Сообщение от пользователя {user_id}:\n{user_message}"
+        await context.bot.send_message(GROUP_ID, admin_text)
+        await save_message(user_id, user_message)
+        await update.message.reply_text("✅ Ваше сообщение отправлено администратору.")
+        context.user_data['contact_admin'] = False
         return
-    resp = ask_deepseek(update.message.text)
-    await update.message.reply_text(resp)
+    
+    try:
+        response = await ask_deepseek(user_message)
+        await update.message.reply_text(response)
+        await save_message(user_id, user_message)
+        await save_message(user_id, response, is_admin=True)  # Сохраняем ответ как от бота
+    except Exception as e:
+        logger.error(f"Ошибка обработки вопроса: {e}")
+        await update.message.reply_text("⚠️ Произошла ошибка при обработке вашего вопроса. Попробуйте позже.")
 
+# Обработчики оплаты
 async def handle_payment_button(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
-    data = query.data
-    if data.startswith('pay_rub'):
-        _, amt = data.split(':')
-        prices = [LabeledPrice("Услуга отписки", int(amt)*100)]
-        await query.bot.send_invoice(
-            chat_id=query.from_user.id,
-            title="Оплата RUB",
-            description="Отписка Бот",
-            payload="pay_rub",
-            provider_token=API_STARS_PROVIDER_TOKEN,
-            currency="RUB",
-            prices=prices
-        )
-    else:
-        _, amt = data.split(':')
-        prices = [LabeledPrice("Услуга отписки", int(amt))]
-        await query.bot.send_invoice(
-            chat_id=query.from_user.id,
-            title="Оплата STAR",
-            description="Отписка Бот",
-            payload="pay_stars",
-            provider_token=API_STARS_PROVIDER_TOKEN,
-            currency="STAR",
-            prices=prices
-        )
+    
+    if query.data.startswith('pay_rub:'):
+        _, amount = query.data.split(':')
+        await send_invoice(context.bot, query.from_user.id, int(amount), "RUB", "Отписка Бот (рубли)")
+        
+    elif query.data.startswith('pay_stars:'):
+        _, amount = query.data.split(':')
+        await send_invoice(context.bot, query.from_user.id, int(amount), "STAR", "Отписка Бот (звёзды)")
+    
+    await query.message.edit_reply_markup(reply_markup=None)
+
+async def send_invoice(bot, chat_id, amount, currency, title):
+    prices = [LabeledPrice(label="Услуга отписки", amount=amount * 100)]
+    
+    await bot.send_invoice(
+        chat_id=chat_id,
+        title=title,
+        description="Услуга отмены нежелательных подписок и списаний",
+        payload="unsubscription_service",
+        provider_token=API_STARS_PROVIDER_TOKEN,
+        currency=currency,
+        prices=prices
+    )
 
 async def pre_checkout(update: Update, context: CallbackContext):
-    await update.pre_checkout_query.answer(ok=True)
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
 
 async def successful_payment(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
     payment = update.message.successful_payment
+    
     await update_payment_status(user_id, "completed")
-    await context.bot.send_message(GROUP_ID,
-        f"✅ Оплата: {update.effective_user.full_name} ID:{user_id} сумма:{payment.total_amount/100}{payment.currency}")
+    
+    await context.bot.send_message(
+        GROUP_ID,
+        f"✅ Оплата прошла: {update.message.from_user.full_name} (ID {user_id})\n"
+        f"Сумма: {payment.total_amount / 100} {payment.currency}"
+    )
+    
     await update.message.reply_text(
-        "✅ Ваш платёж подтверждён! Ожидайте завершения услуги."
+        "✅ Ваш платёж подтверждён! Мы уже начали работу над вашей отпиской.\n"
+        "Обычно это занимает 1-3 рабочих дня. Вы получите уведомление о результате."
     )
 
+# Отмена формы
 async def cancel(update: Update, context: CallbackContext):
-    await update.message.reply_text('❌ Отмена.')
+    await update.message.reply_text('❌ Процесс отменён.')
     context.user_data.clear()
     return ConversationHandler.END
 
-# Main
+# Основная функция
 def main():
+    # Инициализация БД
     asyncio.run(init_db())
-    app = Application.builder().token(TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler('start', start), CallbackQueryHandler(handle_buttons)],
+    
+    # Создание приложения
+    application = Application.builder().token(TOKEN).build()
+    
+    # Обработчики
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('start', start),
+            CallbackQueryHandler(handle_buttons, pattern='^(start_form|contact_admin|about_service)$')
+        ],
         states={
             FIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_fio)],
             SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_source)],
             BANK: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_bank)],
             CARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_card)],
             EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_email)],
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_phone)]
+            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_phone)],
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_message=True,
+        per_user=True,
+        per_chat=True
     )
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(handle_payment_button, pattern='^pay_'))
-    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))
-    logger.info("Бот запущен")
-    app.run_polling()
+    
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(handle_payment_button, pattern='^pay_(rub|stars):'))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    application.add_handler(PreCheckoutQueryHandler(pre_checkout))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text))
+    
+    # Запуск бота
+    logger.info("Бот для отписки запущен")
+    application.run_polling()
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.critical(f"Критическая ошибка: {e}")

@@ -323,7 +323,7 @@ async def handle_free_text(update: Update, context: CallbackContext):
         response = await ask_deepseek(user_message)
         await update.message.reply_text(response)
         await save_message(user_id, user_message)
-        await save_message(user_id, response, is_admin=True)  # Сохраняем ответ как от бота
+        await save_message(user_id, response, is_admin=True)
     except Exception as e:
         logger.error(f"Ошибка обработки вопроса: {e}")
         await update.message.reply_text("⚠️ Произошла ошибка при обработке вашего вопроса. Попробуйте позже.")
@@ -384,9 +384,9 @@ async def cancel(update: Update, context: CallbackContext):
     return ConversationHandler.END
 
 # Основная функция
-def main():
+async def main():
     # Инициализация БД
-    asyncio.run(init_db())
+    await init_db()
     
     # Создание приложения
     application = Application.builder().token(TOKEN).build()
@@ -394,7 +394,6 @@ def main():
     # Обработчики
     conv_handler = ConversationHandler(
         entry_points=[
-            CommandHandler('start', start),
             CallbackQueryHandler(handle_buttons, pattern='^(start_form|contact_admin|about_service)$')
         ],
         states={
@@ -406,11 +405,12 @@ def main():
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_phone)],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
-        per_message=True,
+        per_message=False,
         per_user=True,
         per_chat=True
     )
     
+    application.add_handler(CommandHandler('start', start))
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(handle_payment_button, pattern='^pay_(rub|stars):'))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
@@ -419,10 +419,10 @@ def main():
     
     # Запуск бота
     logger.info("Бот для отписки запущен")
-    application.run_polling()
+    await application.run_polling()
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except Exception as e:
         logger.critical(f"Критическая ошибка: {e}")
